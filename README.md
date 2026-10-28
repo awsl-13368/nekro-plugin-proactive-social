@@ -159,7 +159,7 @@
 
 | 命令 | 作用 |
 |---|---|
-| `/proactive status` | 念头、今日计数、未完话题、停发状态 |
+| `/proactive status` | 念头、今日计数、疲惫/兴致、记忆条数、未完话题、停发/收敛状态 |
 | `/proactive dry` | **预览**此刻会说什么（不发送、不消耗） |
 | `/proactive test` | 立刻真发一条 |
 | `/proactive log` | 最近 8 条主动消息及由头 |

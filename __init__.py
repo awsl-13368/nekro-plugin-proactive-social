@@ -79,7 +79,7 @@ plugin = NekroPlugin(
     name="主动消息",
     module_name="proactive_social",
     description="念头驱动的主动社交：有由头才开口，会追问/接话/回访/收场，被无视就停",
-    version="4.0.0",
+    version="4.0.1",
     author="awsl_13368",
     url="",
     support_adapter=["onebot_v11"],
@@ -1764,7 +1764,7 @@ async def on_init():
 
     if _scheduler_task is None or _scheduler_task.done():
         _scheduler_task = asyncio.create_task(scheduler_loop())
-    core.logger.info("[proactive3] 初始化完成（v3 念头驱动）")
+    core.logger.info("[proactive3] 初始化完成（v4 念头驱动 · 抑制 · 记忆 · 反省）")
 
 
 @plugin.mount_cleanup_method()
@@ -1927,7 +1927,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage):
 
 @plugin.mount_command(
     name="proactive",
-    description="主动消息 v3：status / dry(预览) / test(真发) / log / on / off / reset",
+    description="主动消息 v4：status / dry(预览) / test(真发) / log / on / off / reset",
     permission=CommandPermission.SUPER_USER,
     category="主动消息",
 )
@@ -2006,19 +2006,25 @@ async def proactive_cmd(
 
     # status
     if not u:
-        return CmdCtl.success("主动消息 v3：还没有记录，等第一条私聊")
+        return CmdCtl.success("主动消息 v4：还没有记录，等第一条私聊")
     now = _now()
     pending_n = len([p for p in u.get("pending", []) if not p.get("done")])
+    restraint = now < float(u.get("restraint_until", 0) or 0)
     lines = [
-        "主动消息 v3（念头驱动）",
-        f"开关：{'开' if config.ENABLE else '关'}   闸门：{'开' if config.LLM_GATE else '关'}",
+        "主动消息 v4（念头驱动 · 抑制 · 记忆 · 反省）",
+        f"开关：{'开' if config.ENABLE else '关'}   "
+        f"闸门：{'开' if config.LLM_GATE else '关'}   "
+        f"抑制：{'开' if config.SUPPRESS_ENABLED else '关'}",
         f"目标：{chat_key}",
         f"念头：{float(u.get('urge', 0)):.0f}/100（攒满约 {config.URGE_REFILL_HOURS}h）",
         f"今日已发：{u.get('sent_today', 0)}/{config.MAX_SENDS_PER_DAY}",
+        f"疲惫：{float(u.get('tired', 0) or 0):.0f}/100   "
+        f"兴致：{float(u.get('mood', 0) or 0):.0f}/100",
+        f"记忆：{len(u.get('memories', []) or [])} 条   未完话题：{pending_n} 条",
         f"距对方上次说话：{minutes_since(u.get('last_user_msg_ts', 0)):.0f} 分钟",
         f"距上次主动：{minutes_since(u.get('last_proactive_ts', 0)):.0f} 分钟",
-        f"未完话题：{pending_n} 条",
-        f"停发中：{'是' if now < float(u.get('silent_until', 0)) else '否'}",
+        f"停发中：{'是' if now < float(u.get('silent_until', 0)) else '否'}   "
+        f"收敛期：{'是' if restraint else '否'}",
         f"安静时段：{config.QUIET_START}-{config.QUIET_END}{'（当前在里面）' if in_quiet() else ''}",
     ]
     return CmdCtl.success("\n".join(lines))
