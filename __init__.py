@@ -80,7 +80,7 @@ plugin = NekroPlugin(
     module_name="proactive_social",
     description="念头驱动的主动社交：有由头才开口，会追问/接话/回访/收场，被无视就停",
     version="4.0.0",
-    author="jixiegem",
+    author="awsl_13368",
     url="",
     support_adapter=["onebot_v11"],
 )

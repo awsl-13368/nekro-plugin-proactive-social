@@ -108,7 +108,7 @@
    configs/nekro-agent.yaml
    PLUGIN_ENABLED:
      - ...
-     - jixiegem.proactive_social
+     - awsl_13368.proactive_social
    ```
    > ⚠️ 不加这一步，面板会显示"未启用"——此时**消息钩子和命令都不会注册**，
    > 只有调度器在跑。也可以直接在面板里点启用。
@@ -171,7 +171,7 @@
 ## 数据
 
 ```
-<plugin_data>/jixiegem.proactive_social/state.json
+<plugin_data>/awsl_13368.proactive_social/state.json
 ```
 
 存：念头、疲劳/兴致、未完话题、时间锚点、加权记忆、发送日志、反省计数。
