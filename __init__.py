@@ -79,7 +79,7 @@ plugin = NekroPlugin(
     name="主动消息",
     module_name="proactive_social",
     description="念头驱动的主动社交：有由头才开口，会追问/接话/回访/收场，被无视就停",
-    version="4.0.1",
+    version="4.1.0",
     author="awsl_13368",
     url="",
     support_adapter=["onebot_v11"],
@@ -298,6 +298,23 @@ class ProactiveConfig(ConfigBase):
     )
     REFLECT_AFTER_MINUTES: int = Field(default=60, ge=5, le=1440, title="多久后反省(分钟)")
     RESTRAINT_HOURS: float = Field(default=24.0, ge=1, le=168, title="反省后收敛多久(小时)")
+
+    # ---------------- 兴致参与决策（v4.1） ----------------
+    MOOD_ENABLED: bool = Field(
+        default=True,
+        title="兴致参与决策",
+        description="兴致低时不说琐事、不撒娇、语气变淡；兴致高时可以多说两句",
+    )
+    MOOD_LOW_THRESHOLD: int = Field(
+        default=35, ge=0, le=100,
+        title="兴致低的门槛",
+        description="兴致低于它就进入「没力气」状态",
+    )
+    MOOD_HIGH_THRESHOLD: int = Field(
+        default=75, ge=0, le=100,
+        title="兴致高的门槛",
+        description="兴致高于它就可以多说两句、带点小雀跃",
+    )
 
     DEBUG: bool = Field(default=False, title="调试日志", description="记录念头进度与拦截原因")
 
@@ -953,6 +970,8 @@ def check_suppression(u: Dict[str, Any], kind: str) -> Optional[str]:
         reason = "对方在忙/累"
     elif light and now < float(u.get("restraint_until", 0) or 0):
         reason = "刚反省过，收着点"
+    elif light and config.MOOD_ENABLED and float(u.get("mood", 60)) <= config.MOOD_LOW_THRESHOLD:
+        reason = f"没兴致({float(u.get('mood', 60)):.0f})"
 
     if reason is None:
         # 这次不压 → 清掉这个 kind 的计数
@@ -1223,12 +1242,15 @@ async def derive_reason(u: Dict[str, Any], msgs: List[Dict[str, Any]]) -> Option
         config.MISS_ENABLED
         and affection_score(u) >= config.MISS_AFFECTION_MIN
         and int(u.get("miss_today", 0) or 0) < config.MISS_DAILY_CAP
+        and (not config.MOOD_ENABLED or float(u.get("mood", 60)) > config.MOOD_LOW_THRESHOLD)
         and random.random() < 0.3
     ):
         return "突然很想对方，说不清为什么，就是想让他知道你惦记着他", "miss", None
 
-    # 6) 生活场景兜底
-    if config.FALLBACK_EVENTS:
+    # 6) 生活场景兜底（没兴致时不说琐事）
+    if config.FALLBACK_EVENTS and (
+        not config.MOOD_ENABLED or float(u.get("mood", 60)) > config.MOOD_LOW_THRESHOLD
+    ):
         ev = pick_life_event()
         if ev:
             return ev, "life", None
@@ -1308,6 +1330,14 @@ async def send_with_reason(u: Dict[str, Any], reason: str, kind: str) -> bool:
     )
     if config.ALLOW_BURST:
         prompt += "\n6. 想拆成两条短句发也可以（像真人习惯性分条发）。"
+
+    # v4.1：按当前兴致调语气
+    if config.MOOD_ENABLED:
+        _mood = float(u.get("mood", 60) or 0)
+        if _mood <= config.MOOD_LOW_THRESHOLD:
+            prompt += "\n* 你现在没什么力气，话短一点、语气淡一点，别用力卖萌。"
+        elif _mood >= config.MOOD_HIGH_THRESHOLD:
+            prompt += "\n* 你现在心情不错，可以多说两句、带点小雀跃。"
 
     # 先闪一下「正在输入」
     await show_typing(chat_key, config.TYPING_SECONDS)
