@@ -81,7 +81,7 @@ plugin = NekroPlugin(
     name="主动消息",
     module_name="proactive_social",
     description="念头驱动的主动社交：有由头才开口，会追问/接话/回访/收场，被无视就停",
-    version="4.1.0",
+    version="4.1.1",
     author="awsl_13368",
     url="",
     support_adapter=["onebot_v11"],
@@ -317,6 +317,12 @@ class ProactiveConfig(ConfigBase):
         default=75, ge=0, le=100,
         title="兴致高的门槛",
         description="兴致高于它就可以多说两句、带点小雀跃",
+    )
+
+    PROMPT_TIME_MODE: str = Field(
+        default="clock",
+        title="提示词时间标记",
+        description="给由头/闸门里的对话加时间：clock=绝对时间（推荐）、relative=几小时前、off=不加",
     )
 
     DEBUG: bool = Field(default=False, title="调试日志", description="记录念头进度与拦截原因")
@@ -715,13 +721,53 @@ async def fetch_recent(chat_key: str, limit: int = 16) -> List[Dict[str, Any]]:
     return out
 
 
-def transcript(msgs: List[Dict[str, Any]], limit: int = 12) -> str:
+def now_label() -> str:
+    """给 prompt 用的「现在」：现在是 2026-11-05 18:20（周四）"""
+    now = datetime.now()
+    week = "一二三四五六日"[now.weekday()]
+    return f"现在是 {now:%Y-%m-%d %H:%M}（周{week}）"
+
+
+def _age_label(ts: float, now_ts: float) -> str:
+    """『今天』『昨天』『3 天前』，给记忆条目标年龄用"""
+    if not ts:
+        return ""
+    days = max(0.0, (now_ts - ts) / 86400.0)
+    if days < 1:
+        return "今天"
+    if days < 2:
+        return "昨天"
+    return f"{days:.0f} 天前"
+
+
+def _msg_time_prefix(ts: float, now_ts: float) -> str:
+    """单条消息的时间前缀；PROMPT_TIME_MODE=off 时不加"""
+    mode = str(getattr(config, "PROMPT_TIME_MODE", "clock") or "clock").lower()
+    if mode == "off" or not ts:
+        return ""
+    if mode == "relative":
+        mins = max(0.0, (now_ts - ts) / 60.0)
+        if mins < 60:
+            return f"[{mins:.0f} 分钟前] "
+        if mins < 24 * 60:
+            return f"[{mins / 60:.1f} 小时前] "
+        return f"[{mins / 1440:.1f} 天前] "
+    d = datetime.fromtimestamp(ts)
+    if d.date() == datetime.fromtimestamp(now_ts).date():
+        return f"[{d:%H:%M}] "
+    return f"[{d:%m-%d %H:%M}] "
+
+
+def transcript(msgs: List[Dict[str, Any]], limit: int = 12, now_ts: Optional[float] = None) -> str:
+    """拼对话给模型看。带时间标记，模型才知道哪些话已经过时了。"""
+    now_ts = float(now_ts) if now_ts else _now()
     lines = []
     for m in msgs[-limit:]:
         who = "我" if m["is_bot"] else "TA"
         t = (m["text"] or "").replace("\n", " ")[:120]
         if t:
-            lines.append(f"{who}: {t}")
+            stamp = _msg_time_prefix(float(m.get("ts", 0) or 0), now_ts)
+            lines.append(f"{stamp}{who}: {t}")
     return "\n".join(lines)
 
 
@@ -1616,10 +1662,15 @@ async def derive_reason(
 
 async def extract_unresolved(msgs: List[Dict[str, Any]], memories: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
     """从最近对话 / 权重最高的记忆里，找一件『提过但没说结果』的事"""
-    convo = transcript(msgs, 14) if msgs else ""
+    now_ts = _now()
+    convo = transcript(msgs, 14, now_ts) if msgs else ""
     mem_lines = ""
     if memories:
-        mem_lines = "\n".join(f"- {m.get('text', '')[:60]}" for m in memories[:5])
+        mem_lines = "\n".join(
+            f"- {m.get('text', '')[:60]}"
+            + (f"（{_age_label(float(m.get('ts', 0) or 0), now_ts)}）" if m.get("ts") else "")
+            for m in memories[:5]
+        )
 
     if not convo and not mem_lines:
         return None
@@ -1627,9 +1678,13 @@ async def extract_unresolved(msgs: List[Dict[str, Any]], memories: Optional[List
         return None
 
     prompt = (
+        f"{now_label()}\n\n"
         "从下面的材料里找出一件「对方提过、但还没说结果」的具体的事"
         "（考试/面试/吃饭/去哪/身体/心情等）。\n"
         "优先挑分量重的事（大事、情绪强的事），别挑鸡毛蒜皮。\n"
+        "方括号里是消息的真实时间，用来判断新旧：\n"
+        "- 一次性的小事（吃饭/天气/在干嘛）过了 2 小时就别再问，会显得脱节；\n"
+        "- 有结果可追的重要事（面试/看病/考试/出差）不受时间限制，只要还没结果就能问。\n"
         "找到了就用一句话描述（20字内）；找不到只回 NONE。\n\n"
     )
     if mem_lines:
@@ -1657,6 +1712,7 @@ async def gate(u: Dict[str, Any], reason: str, msgs: List[Dict[str, Any]]) -> bo
 
     convo = transcript(msgs, 8)
     prompt = (
+        f"{now_label()}\n\n"
         "判断现在要不要主动给对方发一条消息。\n\n"
         f"【由头】{reason}\n\n"
         f"【最近对话】\n{convo or '（最近没有对话）'}\n\n"
@@ -1689,13 +1745,15 @@ async def send_with_reason(u: Dict[str, Any], reason: str, kind: str) -> bool:
     chat_key = u["chat_key"]
     prompt = (
         "【主动开口的时机到了】\n"
+        f"{now_label()}\n"
         f"此刻你心里冒出的事：{reason}\n\n"
         "要求：\n"
         "1. 就着这件事自然开口，别解释这是主动消息、别提『由头』；\n"
         f"2. 不超过 {config.MAX_MESSAGE_LENGTH} 字；\n"
         "3. 不要只问『在吗』，直接说事；\n"
         "4. 用你平时的语气和人设，可以带括号动作；\n"
-        "5. 别重复你上一句说过的内容。"
+        "5. 别重复你上一句说过的内容。\n"
+        "* 说话要贴合现在的时间点；别把几小时前、甚至更早的事说成刚刚发生。"
     )
     if config.ALLOW_BURST:
         prompt += "\n6. 想拆成两条短句发也可以（像真人习惯性分条发）。"
