@@ -393,6 +393,20 @@ def normalize_chat_key(raw: str) -> str:
     return s
 
 
+_BAD_KEY_WARNED = {"done": False}
+
+
+def _warn_bad_chat_key(raw: str) -> None:
+    """CHAT_KEY 既不是纯数字也不是完整 chat_key 时只提示一次，避免每轮心跳刷屏"""
+    if _BAD_KEY_WARNED["done"]:
+        return
+    _BAD_KEY_WARNED["done"] = True
+    core.logger.warning(
+        f"[proactive3] CHAT_KEY 无效（当前={raw!r}），念头不会累积；"
+        "请填 QQ 号或 onebot_v11-private_<QQ>"
+    )
+
+
 def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -1973,8 +1987,9 @@ async def tick() -> None:
     except Exception:
         pass
 
-    chat_key = (config.CHAT_KEY or "").strip() or st.get("last_chat_key", "")
+    chat_key = normalize_chat_key(config.CHAT_KEY) or st.get("last_chat_key", "")
     if not chat_key or "-private_" not in chat_key:
+        _warn_bad_chat_key(config.CHAT_KEY)
         save_state(st)
         return
     st["last_chat_key"] = chat_key
@@ -2134,7 +2149,7 @@ async def on_init():
         return
 
     # 启动自检：确认三件事都能用（不调模型、不发消息）
-    chat_key = (config.CHAT_KEY or "").strip()
+    chat_key = normalize_chat_key(config.CHAT_KEY)
     if chat_key and "-private_" in chat_key:
         try:
             msgs = await fetch_recent(chat_key, 10)
@@ -2370,7 +2385,9 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage):
         keep.append(p)
     u["pending"] = keep[-10:]
 
-    commit(u)
+    # 钩子是 memories 的唯一生产者：让它对自己的列表有权威，
+    # 否则 commit() 会用磁盘旧列表覆盖掉刚 add_memory 进去的那条
+    commit(u, force={"memories"})
     return None
 
 
@@ -2390,7 +2407,7 @@ async def proactive_cmd(
     sub = (sub or "status").lower()
 
     st = load_state()
-    chat_key = (config.CHAT_KEY or "").strip() or st.get("last_chat_key", "")
+    chat_key = normalize_chat_key(config.CHAT_KEY) or st.get("last_chat_key", "")
     u = get_user(st, chat_key) if chat_key else None
     # 修复 R24-2：status 也要先跨天清零，否则会显示昨天的"今日已发"
     if u:
@@ -2494,7 +2511,8 @@ async def proactive_cmd(
         f"闸门：{gate_line}   "
         f"抑制：{'开' if config.SUPPRESS_ENABLED else '关'}",
         f"当前时间：{datetime.now().strftime('%H:%M')}（服务器本地）",
-        f"目标：{chat_key}",
+        f"目标：{chat_key}"
+        + ("" if "-private_" in chat_key else "   ⚠️ 格式不对，应为 onebot_v11-private_QQ号"),
         f"念头：{float(u.get('urge', 0)):.0f}/100（攒满约 {config.URGE_REFILL_HOURS}h）",
         f"今日已发：{u.get('sent_today', 0)}/{config.MAX_SENDS_PER_DAY}",
         f"疲惫：{float(u.get('tired', 0) or 0):.0f}/100   "
