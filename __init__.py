@@ -81,7 +81,7 @@ plugin = NekroPlugin(
     name="主动消息",
     module_name="proactive_social",
     description="念头驱动的主动社交：有由头才开口，会追问/接话/回访/收场，被无视就停",
-    version="4.1.2",
+    version="4.2.0",
     author="awsl_13368",
     url="",
     support_adapter=["onebot_v11"],
@@ -223,26 +223,6 @@ class ProactiveConfig(ConfigBase):
 
     # ---------------- 数据清理 ----------------
     USER_RETENTION_DAYS: float = Field(default=30.0, ge=0, le=365, title="闲置清理(天)", description="多久没互动就清掉状态，0=不清理")
-
-    # ---------------- 群聊心流 ----------------
-    GROUP_FLOW_ENABLED: bool = Field(
-        default=False,
-        title="群聊心流",
-        description="在群里自然接话/破冰/起话题（默认关；开了她才会在群里主动说话）",
-    )
-    GROUP_FLOW_WHITELIST: List[str] = Field(default=[], title="只在这些群生效", description="填群号；留空=所有已聊过的群")
-    GROUP_FLOW_WINDOW_MINUTES: int = Field(default=8, ge=1, le=120, title="说过话后的关注窗口(分钟)")
-    GROUP_FLOW_HOLD_SECONDS: int = Field(default=120, ge=10, le=600, title="被回完后先静多久(秒)", description="防自己跟自己连成一串")
-    GROUP_FLOW_MIN_GAP_SECONDS: int = Field(default=120, ge=30, le=1800, title="两次插话最短间隔(秒)")
-    GROUP_FLOW_MAX_PER_WINDOW: int = Field(default=3, ge=1, le=10, title="一个窗口最多接几条")
-    GROUP_FLOW_HOURLY_CAP: int = Field(default=6, ge=0, le=60, title="每群每小时上限")
-    GROUP_FLOW_IGNORED_EXIT: int = Field(default=2, ge=1, le=10, title="连插几条没人接就退场")
-    GROUP_ICEBREAK_ENABLED: bool = Field(default=True, title="破冰", description="群里冷场时开个话头")
-    GROUP_IDLE_HOURS: float = Field(default=6.0, ge=0.5, le=72, title="群冷场多久算冷场(小时)")
-    GROUP_ICEBREAK_DAILY_CAP: int = Field(default=2, ge=0, le=20, title="每群每天破冰上限")
-    GROUP_TOPIC_ENABLED: bool = Field(default=True, title="起话头", description="她在群里静了很久，主动说点自己的事")
-    GROUP_TOPIC_GAP_HOURS: float = Field(default=8.0, ge=0.5, le=168, title="静多久才起话头(小时)")
-    GROUP_TOPIC_DAILY_CAP: int = Field(default=1, ge=0, le=10, title="每群每天起话头上限")
 
     # ---------------- 播种与静音结束 ----------------
     SEED_USERS: List[str] = Field(
@@ -426,10 +406,16 @@ def ensure_today(u: Dict[str, Any]) -> None:
         u["miss_today"] = 0
 
 
+def _drop_legacy(st: Dict[str, Any]) -> Dict[str, Any]:
+    """4.2.0 移除了群聊心流：清掉旧状态里的 groups 残留"""
+    st.pop("groups", None)
+    return st
+
+
 def load_state() -> Dict[str, Any]:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return _drop_legacy(json.loads(STATE_FILE.read_text(encoding="utf-8")))
         except Exception as e:
             core.logger.warning(f"[proactive3] 状态文件解析失败: {e}")
             _quarantine_state(STATE_FILE)
@@ -437,7 +423,7 @@ def load_state() -> Dict[str, Any]:
         try:
             st = json.loads(STATE_BAK.read_text(encoding="utf-8"))
             core.logger.warning("[proactive3] 已回退到 state.json.bak（上一次的完好状态）")
-            return st
+            return _drop_legacy(st)
         except Exception as e:
             core.logger.warning(f"[proactive3] 备份状态也读不了: {e}")
     return {"users": {}}
@@ -454,28 +440,6 @@ def save_state(st: Dict[str, Any]) -> None:
         _atomic_write_text(STATE_FILE, json.dumps(st, ensure_ascii=False, indent=2))
     except Exception as e:
         core.logger.warning(f"[proactive3] 保存状态失败: {e}")
-
-
-def commit_groups(gk: str, changes: Dict[str, Any]) -> None:
-    """只改一个群的字段，不碰 users（修复 A4 问题 2）"""
-    try:
-        st = load_state()
-        g = (st.get("groups") or {}).get(gk) or {"chat_key": gk}
-        g.update(changes or {})
-        st.setdefault("groups", {})[gk] = g
-        save_state(st)
-    except Exception as e:
-        core.logger.warning(f"[proactive3] 保存群状态失败: {e}")
-
-
-def flush_groups(st: Dict[str, Any]) -> None:
-    """把内存里的 groups 写回磁盘，users 用磁盘上的最新值（A4 问题 2）"""
-    try:
-        disk = load_state()
-        disk["groups"] = st.get("groups") or {}
-        save_state(disk)
-    except Exception as e:
-        core.logger.warning(f"[proactive3] 保存群状态失败: {e}")
 
 
 def commit(
@@ -808,16 +772,6 @@ def _model_args() -> Dict[str, Any]:
 
 _NO_MODEL_LOGGED = {"done": False}
 _MODEL_PREFER_WARNED = {"done": False}
-_GROUP_WARN_TS: Dict[str, float] = {}
-
-
-def _warn_group_once(chat_key: str) -> None:
-    """群闸门无答案的告警：同一群一小时内只写一次"""
-    now = _now()
-    last = float(_GROUP_WARN_TS.get(chat_key, 0) or 0)
-    if now - last >= 3600:
-        _GROUP_WARN_TS[chat_key] = now
-        core.logger.warning(f"[proactive3] 群聊闸门无有效回复，按否决 {chat_key}")
 
 
 def _log_no_model_once() -> None:
@@ -1043,40 +997,6 @@ def greeting_window(now: datetime) -> Optional[str]:
     if in_range(now, config.GREETING_NIGHT_START, config.GREETING_NIGHT_END):
         return "night"
     return None
-
-
-# ======================================================================== 群聊状态
-
-
-def get_group(st: Dict[str, Any], chat_key: str) -> Dict[str, Any]:
-    groups = st.setdefault("groups", {})
-    g = groups.get(chat_key)
-    if not g:
-        g = {
-            "chat_key": chat_key,
-            "last_msg_ts": 0,
-            "last_bot_ts": 0,
-            "flow_until": 0,
-            "interjects": 0,
-            "interject_ts": [],
-            "ignored_streak": 0,
-            "topic_date": "",
-            "topic_count": 0,
-            "ice_date": "",
-            "ice_count": 0,
-            "flow_date": "",
-        }
-        groups[chat_key] = g
-    return g
-
-
-def group_allowed(chat_key: str) -> bool:
-    wl = [str(x) for x in (config.GROUP_FLOW_WHITELIST or [])]
-    if not wl:
-        return True
-    gid = str(chat_key).split("_")[-1]
-    return gid in wl
-
 
 
 # ======================================================================== 动机层（v4）
@@ -1815,160 +1735,6 @@ async def send_with_reason(u: Dict[str, Any], reason: str, kind: str) -> bool:
     return True
 
 
-# ======================================================================== 群聊心流
-
-GROUP_INTENT = {
-    "interject": "群里正在聊，你插一句自然的话（别点名、别抢话题，接得上才说）",
-    "icebreak": "群里冷场很久了，抛一个轻松的话头（关于你自己的小事/天气/节日）",
-    "topic": "你在群里静了很久，想说点自己的事开个话题（不要问别人问题，先说自己）",
-}
-
-
-async def group_gate(chat_key: str, g: Dict[str, Any], msgs: List[Dict[str, Any]], intent: str) -> bool:
-    """群里该不该说话（模型判断）"""
-    if not config.LLM_GATE:
-        return True
-    convo = transcript(msgs, 10)
-    prompt = (
-        f"你是群聊里的一个普通成员。现在考虑：{GROUP_INTENT.get(intent, intent)}\n\n"
-        f"【最近群聊】\n{convo or '（群很安静）'}\n\n"
-        f"【距群里最后一条消息】{minutes_since(g.get('last_msg_ts', 0)):.0f} 分钟\n"
-        f"【距你自己上次说话】{minutes_since(g.get('last_bot_ts', 0)):.0f} 分钟\n\n"
-        "判断：现在开口会不会显得多余/打断别人/硬凑？\n"
-        "接得上、自然、不抢话 → ALLOW；没必要或会突兀 → SKIP\n"
-        "只回一个词：ALLOW 或 SKIP"
-    )
-    if not _model_args():
-        _log_no_model_once()
-        return True
-
-    ans = (await llm_chat(prompt, max_tokens=200, timeout=20.0, temperature=0.3)).upper()
-    verdict = _first_verdict(ans)
-    if verdict is None:
-        # 修复 R22：不依赖 DEBUG；同一群 1 小时内只写一次
-        _warn_group_once(chat_key)
-        return False
-    if verdict == "SKIP":
-        if config.DEBUG:
-            core.logger.info(f"[proactive3] 群聊闸门否决({intent}) {chat_key}")
-        return False
-    return True
-
-
-async def send_group_flow(chat_key: str, g: Dict[str, Any], intent: str, msgs: List[Dict[str, Any]]) -> bool:
-    convo = transcript(msgs, 8)
-    prompt = (
-        "【群聊里的自然发言】\n"
-        f"你现在要做的：{GROUP_INTENT.get(intent, intent)}\n\n"
-        f"【最近群聊】\n{convo or '（群很安静）'}\n\n"
-        "要求：\n"
-        f"1. 不超过 {config.MAX_MESSAGE_LENGTH} 字，口语化；\n"
-        "2. 针对整个群说，不点名；\n"
-        "3. 别像客服、别总结别人说的话；\n"
-        "4. 接得上就接，接不上就顺着自己的话头说。"
-    )
-    try:
-        await message_service.push_system_message(
-            chat_key=chat_key,
-            agent_messages=prompt,
-            trigger_agent=True,
-        )
-    except Exception as e:
-        core.logger.warning(f"[proactive3] 群发言失败: {e}")
-        return False
-
-    now = _now()
-    g["last_bot_ts"] = now
-    g["flow_until"] = now + config.GROUP_FLOW_WINDOW_MINUTES * 60
-    g["interjects"] = 0
-    core.logger.info(f"[proactive3] 群内开口({intent}) -> {chat_key}")
-    return True
-
-
-async def group_flow_tick(st: Dict[str, Any]) -> bool:
-    if not config.GROUP_FLOW_ENABLED:
-        return False
-
-    now = _now()
-    for gk, g in list((st.get("groups") or {}).items()):
-        if not group_allowed(gk):
-            continue
-
-        if g.get("flow_date") != _today():
-            g["flow_date"] = _today()
-            g["ice_count"] = 0
-            g["topic_count"] = 0
-
-        g["interject_ts"] = [t for t in (g.get("interject_ts") or []) if now - t < 3600]
-
-        # 安静时段不在群里说话
-        if in_quiet():
-            continue
-
-        msgs = await fetch_recent(gk, 12)
-        idle_h = hours_since(g.get("last_msg_ts", 0)) if g.get("last_msg_ts") else 999.0
-
-        # 连插几条都没人接 → 退场安静下来
-        fu = float(g.get("flow_until", 0) or 0)
-        if fu and fu < now:
-            spoke_after = float(g.get("last_msg_ts", 0) or 0) > float(g.get("last_bot_ts", 0) or 0)
-            if not spoke_after:
-                g["ignored_streak"] = int(g.get("ignored_streak", 0) or 0) + 1
-                if int(g["ignored_streak"]) >= config.GROUP_FLOW_IGNORED_EXIT:
-                    g["flow_until"] = 0
-                    core.logger.info(
-                        f"[proactive3] 群里连着 {g['ignored_streak']} 次没人接，退出心流: {gk}"
-                    )
-            else:
-                g["ignored_streak"] = 0
-            g["flow_until"] = 0
-
-        # 1) 心流接话
-        in_window = float(g.get("flow_until", 0) or 0) > now
-        fresh = (now - float(g.get("last_msg_ts", 0) or 0)) < config.GROUP_FLOW_WINDOW_MINUTES * 60
-        gap_ok = (now - float(g.get("last_bot_ts", 0) or 0)) >= max(
-            config.GROUP_FLOW_MIN_GAP_SECONDS, config.GROUP_FLOW_HOLD_SECONDS
-        )
-        hourly_ok = len(g["interject_ts"]) < config.GROUP_FLOW_HOURLY_CAP
-        if (
-            in_window
-            and fresh
-            and gap_ok
-            and hourly_ok
-            and int(g.get("interjects", 0) or 0) < config.GROUP_FLOW_MAX_PER_WINDOW
-            and msgs
-        ):
-            if await group_gate(gk, g, msgs, "interject"):
-                if await send_group_flow(gk, g, "interject", msgs):
-                    g["interject_ts"].append(now)
-                    g["interjects"] = int(g.get("interjects", 0) or 0) + 1
-                    return True
-
-        # 2) 破冰
-        if (
-            config.GROUP_ICEBREAK_ENABLED
-            and idle_h >= config.GROUP_IDLE_HOURS
-            and int(g.get("ice_count", 0) or 0) < config.GROUP_ICEBREAK_DAILY_CAP
-        ):
-            if await group_gate(gk, g, msgs, "icebreak"):
-                if await send_group_flow(gk, g, "icebreak", msgs):
-                    g["ice_count"] = int(g.get("ice_count", 0) or 0) + 1
-                    return True
-
-        # 3) 起话头
-        if (
-            config.GROUP_TOPIC_ENABLED
-            and hours_since(g.get("last_bot_ts", 0)) >= config.GROUP_TOPIC_GAP_HOURS
-            and int(g.get("topic_count", 0) or 0) < config.GROUP_TOPIC_DAILY_CAP
-        ):
-            if await group_gate(gk, g, msgs, "topic"):
-                if await send_group_flow(gk, g, "topic", msgs):
-                    g["topic_count"] = int(g.get("topic_count", 0) or 0) + 1
-                    return True
-
-    return False
-
-
 # ======================================================================== 清理
 
 
@@ -2043,13 +1809,6 @@ async def tick() -> None:
     # 修复 R21-3：tick 起点必须在任何 await / load_state 之前
     _tick_start = _now()
     st = load_state()
-
-    # 群聊心流（独立于私聊念头）
-    try:
-        if await group_flow_tick(st):
-            flush_groups(st)
-    except Exception as e:
-        core.logger.warning(f"[proactive3] 群心流异常: {e}")
 
     # 闲置清理
     try:
@@ -2303,20 +2062,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage):
     except Exception:
         return None
 
-    # ---- 群聊：只用于心流，不做"人"处理 ----
-    if "-group_" in chat_key:
-        if config.GROUP_FLOW_ENABLED and group_allowed(chat_key):
-            try:
-                _st = load_state()
-                g = get_group(_st, chat_key)
-                now = _now()
-                g["last_msg_ts"] = now
-                flush_groups(_st)
-            except Exception as e:
-                core.logger.warning(f"[proactive3] 群状态更新失败: {e}")
-        return None
-
-    # 本插件只关心私聊
+    # 本插件只做私聊：群消息一律不看、不记、不触发
     if "-private_" not in chat_key:
         return None
 
