@@ -81,7 +81,7 @@ plugin = NekroPlugin(
     name="主动消息",
     module_name="proactive_social",
     description="念头驱动的主动社交：有由头才开口，会追问/接话/回访/收场，被无视就停",
-    version="4.1.1",
+    version="4.1.2",
     author="awsl_13368",
     url="",
     support_adapter=["onebot_v11"],
@@ -243,8 +243,6 @@ class ProactiveConfig(ConfigBase):
     GROUP_TOPIC_ENABLED: bool = Field(default=True, title="起话头", description="她在群里静了很久，主动说点自己的事")
     GROUP_TOPIC_GAP_HOURS: float = Field(default=8.0, ge=0.5, le=168, title="静多久才起话头(小时)")
     GROUP_TOPIC_DAILY_CAP: int = Field(default=1, ge=0, le=10, title="每群每天起话头上限")
-    GROUP_STORE_SAMPLES: bool = Field(default=False, title="采集群友发言风格", description="目前仅存储，不参与决策")
-    GROUP_REF_SAMPLE_SIZE: int = Field(default=30, ge=0, le=200, title="每群保留样本数")
 
     # ---------------- 播种与静音结束 ----------------
     SEED_USERS: List[str] = Field(
@@ -779,13 +777,29 @@ def _model_args() -> Dict[str, Any]:
         return {}
     try:
         groups = core_config.MODEL_GROUPS or {}
-        for key in ("default", *list(groups.keys())):
+        # v4.1.1：优先跟随主程序的 USE_MODEL_GROUP，和 NA 自己用同一个分组
+        prefer = str(getattr(core_config, "USE_MODEL_GROUP", "") or "").strip()
+        order: List[str] = []
+        for key in (prefer, "default"):
+            if key and key not in order:
+                order.append(key)
+        for key in groups.keys():
+            if key not in order:
+                order.append(key)
+        for key in order:
             g = groups.get(key)
             if g and getattr(g, "MODEL_TYPE", "chat") == "chat" and getattr(g, "API_KEY", ""):
+                if prefer and key != prefer and not _MODEL_PREFER_WARNED["done"]:
+                    _MODEL_PREFER_WARNED["done"] = True
+                    core.logger.warning(
+                        f"[proactive3] 主模型分组 {prefer!r} 不可用（不存在/不是 chat/无 API Key），"
+                        f"回退到 {key!r}"
+                    )
                 return {
                     "model": g.CHAT_MODEL,
                     "api_key": g.API_KEY,
                     "base_url": g.BASE_URL,
+                    "group": key,
                 }
     except Exception as e:
         core.logger.warning(f"[proactive3] 读取模型配置失败: {e}")
@@ -793,6 +807,7 @@ def _model_args() -> Dict[str, Any]:
 
 
 _NO_MODEL_LOGGED = {"done": False}
+_MODEL_PREFER_WARNED = {"done": False}
 _GROUP_WARN_TS: Dict[str, float] = {}
 
 
@@ -1045,7 +1060,6 @@ def get_group(st: Dict[str, Any], chat_key: str) -> Dict[str, Any]:
             "interjects": 0,
             "interject_ts": [],
             "ignored_streak": 0,
-            "samples": [],
             "topic_date": "",
             "topic_count": 0,
             "ice_date": "",
@@ -2253,7 +2267,9 @@ async def on_init():
 
     args = _model_args()
     if args:
-        core.logger.info(f"[proactive3] 自检·模型: {args.get('model')}")
+        core.logger.info(
+            f"[proactive3] 自检·模型: {args.get('model')}（分组 {args.get('group')}）"
+        )
     else:
         core.logger.warning("[proactive3] 自检·模型不可用（闸门/回访会降级）")
 
@@ -2295,17 +2311,6 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage):
                 g = get_group(_st, chat_key)
                 now = _now()
                 g["last_msg_ts"] = now
-                if config.GROUP_STORE_SAMPLES:
-                    txt = ""
-                    try:
-                        txt = (getattr(message, "content_text", "") or "").strip()
-                    except Exception:
-                        txt = ""
-                    if txt and len(txt) > 3 and not txt.startswith("/"):
-                        samples = g.setdefault("samples", [])
-                        samples.append(txt[:100])
-                        keep = max(0, int(config.GROUP_REF_SAMPLE_SIZE))
-                        g["samples"] = samples[-keep:] if keep else []
                 flush_groups(_st)
             except Exception as e:
                 core.logger.warning(f"[proactive3] 群状态更新失败: {e}")
@@ -2557,12 +2562,13 @@ async def proactive_cmd(
     pending_n = len([p for p in u.get("pending", []) if not p.get("done")])
     restraint = now < float(u.get("restraint_until", 0) or 0)
     # 修复 R22：闸门有三种态 —— 关 / 开+有模型 / 开但无可用模型
+    _margs = _model_args()
     if not config.LLM_GATE:
         gate_line = "关"
-    elif not _model_args():
+    elif not _margs:
         gate_line = "开·无可用模型（按关闭处理）"
     else:
-        gate_line = "开"
+        gate_line = f"开（分组 {_margs.get('group')} · {_margs.get('model')}）"
     lines = [
         "主动消息 v4（念头驱动 · 抑制 · 记忆 · 反省）",
         f"开关：{'开' if config.ENABLE else '关'}   "

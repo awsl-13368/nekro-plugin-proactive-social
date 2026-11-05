@@ -117,9 +117,6 @@ class TestC6Topics(Base):
         self.assertFalse(self.mod.memory_allowed("约炮 赌博"))
         self.assertTrue(self.mod.memory_allowed("今天吃了拉面"))
 
-    def test_group_samples_default_off(self):
-        self.assertFalse(self.mod.config.GROUP_STORE_SAMPLES)
-
 
 class _Msg:
     def __init__(self, text):
