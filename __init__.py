@@ -39,7 +39,9 @@
 
 import asyncio
 import json
+import os
 import random
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -153,6 +155,7 @@ class ProactiveConfig(ConfigBase):
 
     CLOSER_ENABLED: bool = Field(default=True, title="收场", description="她发的话没人接时，自己冒一句收尾")
     CLOSER_AFTER_HOURS: float = Field(default=8.0, ge=1, le=48, title="收场等待(小时)")
+    CLOSER_MAX_COUNT: int = Field(default=3, ge=0, le=10, title="最多收场几次")
 
     SILENT_GIVEAWAY_DAYS: float = Field(
         default=3.0, ge=0, le=60,
@@ -240,7 +243,7 @@ class ProactiveConfig(ConfigBase):
     GROUP_TOPIC_ENABLED: bool = Field(default=True, title="起话头", description="她在群里静了很久，主动说点自己的事")
     GROUP_TOPIC_GAP_HOURS: float = Field(default=8.0, ge=0.5, le=168, title="静多久才起话头(小时)")
     GROUP_TOPIC_DAILY_CAP: int = Field(default=1, ge=0, le=10, title="每群每天起话头上限")
-    GROUP_STORE_SAMPLES: bool = Field(default=True, title="采集群友发言风格")
+    GROUP_STORE_SAMPLES: bool = Field(default=False, title="采集群友发言风格", description="目前仅存储，不参与决策")
     GROUP_REF_SAMPLE_SIZE: int = Field(default=30, ge=0, le=200, title="每群保留样本数")
 
     # ---------------- 播种与静音结束 ----------------
@@ -339,12 +342,38 @@ def _resolve_state_dir() -> Path:
 
 STATE_DIR = _resolve_state_dir()
 STATE_FILE = STATE_DIR / "state.json"
+STATE_BAK = STATE_DIR / "state.json.bak"
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写：先写 .tmp，flush+fsync 后 os.replace 覆盖。
+    写到一半被中断时，原文件不受影响。"""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    os.replace(tmp, path)
+
+
+def _quarantine_state(path: Path) -> None:
+    """把坏掉的状态文件改名保留，不删除"""
+    try:
+        bad = path.with_name(path.name + ".corrupt-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+        os.replace(path, bad)
+        core.logger.warning(f"[proactive3] 坏状态文件已改名保留: {bad.name}")
+    except Exception as e:
+        core.logger.warning(f"[proactive3] 坏状态文件改名失败: {e}")
+
 
 # 一次性迁移：早期版本把 state.json 写在 plugin_data/proactive_social/
 _LEGACY_STATE = Path(__file__).resolve().parent.parent.parent / "plugin_data" / "proactive_social" / "state.json"
 if (not STATE_FILE.exists()) and _LEGACY_STATE.exists() and _LEGACY_STATE != STATE_FILE:
     try:
-        STATE_FILE.write_text(_LEGACY_STATE.read_text(encoding="utf-8"), encoding="utf-8")
+        _atomic_write_text(STATE_FILE, _LEGACY_STATE.read_text(encoding="utf-8"))
         core.logger.info("[proactive3] 已从旧路径迁移状态")
     except Exception as e:
         core.logger.warning(f"[proactive3] 状态迁移失败: {e}")
@@ -354,34 +383,135 @@ def _now() -> float:
     return time.time()
 
 
+def normalize_chat_key(raw: str) -> str:
+    """修复 C1：纯数字补成 onebot_v11-private_<QQ>；已是完整格式或其它协议前缀的不动"""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if s.isdigit():
+        return f"onebot_v11-private_{s}"
+    return s
+
+
 def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def ensure_today(u: Dict[str, Any]) -> None:
+    """修复 B5：跨天清零统一走这里（can_send / send_with_reason / status 共用）"""
+    d = _today()
+    if u.get("sent_date") != d:
+        u["sent_date"] = d
+        u["sent_today"] = 0
+    if u.get("miss_date") != d:
+        u["miss_date"] = d
+        u["miss_today"] = 0
+
+
 def load_state() -> Dict[str, Any]:
-    try:
-        if STATE_FILE.exists():
+    if STATE_FILE.exists():
+        try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        core.logger.warning(f"[proactive3] 读取状态失败: {e}")
+        except Exception as e:
+            core.logger.warning(f"[proactive3] 状态文件解析失败: {e}")
+            _quarantine_state(STATE_FILE)
+    if STATE_BAK.exists():
+        try:
+            st = json.loads(STATE_BAK.read_text(encoding="utf-8"))
+            core.logger.warning("[proactive3] 已回退到 state.json.bak（上一次的完好状态）")
+            return st
+        except Exception as e:
+            core.logger.warning(f"[proactive3] 备份状态也读不了: {e}")
     return {"users": {}}
 
 
 def save_state(st: Dict[str, Any]) -> None:
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+        if STATE_FILE.exists():
+            try:
+                _atomic_write_text(STATE_BAK, STATE_FILE.read_text(encoding="utf-8"))
+            except Exception as e:
+                core.logger.warning(f"[proactive3] 备份状态失败（继续写入）: {e}")
+        _atomic_write_text(STATE_FILE, json.dumps(st, ensure_ascii=False, indent=2))
     except Exception as e:
         core.logger.warning(f"[proactive3] 保存状态失败: {e}")
 
 
-def commit(u: Dict[str, Any]) -> None:
-    """安全落盘：合并磁盘上可能更新的用户侧数据，避免 tick 覆盖刚到的消息"""
+def commit_groups(gk: str, changes: Dict[str, Any]) -> None:
+    """只改一个群的字段，不碰 users（修复 A4 问题 2）"""
+    try:
+        st = load_state()
+        g = (st.get("groups") or {}).get(gk) or {"chat_key": gk}
+        g.update(changes or {})
+        st.setdefault("groups", {})[gk] = g
+        save_state(st)
+    except Exception as e:
+        core.logger.warning(f"[proactive3] 保存群状态失败: {e}")
+
+
+def flush_groups(st: Dict[str, Any]) -> None:
+    """把内存里的 groups 写回磁盘，users 用磁盘上的最新值（A4 问题 2）"""
+    try:
+        disk = load_state()
+        disk["groups"] = st.get("groups") or {}
+        save_state(disk)
+    except Exception as e:
+        core.logger.warning(f"[proactive3] 保存群状态失败: {e}")
+
+
+def commit(
+    u: Dict[str, Any],
+    force: Optional[set] = None,
+    deltas: Optional[Dict[str, float]] = None,
+    tick_start_ts: Optional[float] = None,
+) -> None:
+    """安全落盘：合并磁盘上可能更新的用户侧数据，避免 tick 覆盖刚到的消息
+
+    force：本次以内存为准、不与磁盘合并的字段集合（reset 用）。
+    deltas：tick 自己的增量（tired/mood 等），用"磁盘值 + 增量"合成，而不是拿旧值覆盖。
+    tick_start_ts：本轮 tick 开始的时刻，用于判断哪些 memories 是 tick 期间钩子新加的。
+    """
+    force = set(force or ())
     st = load_state()
     disk = (st.get("users") or {}).get(u["chat_key"])
     if disk:
+        # 修复 A4：tired/mood 按增量合并（磁盘值 + 本轮增量），钩子的 ±6/±8 不被盖掉
+        for _f, _d in (deltas or {}).items():
+            base = float(disk.get(_f, u.get(_f, 0.0)) or 0.0)
+            u[_f] = max(0.0, min(100.0, base + float(_d)))
+
+        # 修复 R21-3（选方案②）：memories 归钩子，tick 侧直接取磁盘，不合并、不会丢
+        if "memories" not in force:
+            u["memories"] = list(disk.get("memories", []) or [])
+
+        # 修复 R21-1：pings 是只增计数，取两边较大的
+        if "pings" not in force:
+            u["pings"] = max(int(u.get("pings", 0) or 0), int(disk.get("pings", 0) or 0))
+
+        # 修复 R22：reflect_at / last_proactive_ts 只有 tick 写，之前用 max() 会把
+        # run_reflection 清的 0 又顶回旧值，导致每个 tick 重复反省。改成 tick 直接写。
+        # reply_credit_ts 是钩子写的，取磁盘。
+        for f in ("user_busy_until", "good_state_ts", "replies", "reply_rate", "reply_credit_ts"):
+            if f in disk and f not in force:
+                u[f] = disk[f]
+
+        # 修复 R21-1：对方在 tick 期间说过话 → 钩子刚把这两个计数清零，取磁盘值
+        _disk_lu = float(disk.get("last_user_msg_ts", 0) or 0)
+        if (
+            tick_start_ts is not None
+            and _disk_lu > float(tick_start_ts)
+            and "closer_count" not in force
+        ):
+            for f in ("closer_count", "no_reply_count"):
+                if f in disk:
+                    u[f] = disk[f]
+
         # 用户侧时间更新的，以磁盘为准
-        if float(disk.get("last_user_msg_ts", 0) or 0) > float(u.get("last_user_msg_ts", 0) or 0):
+        if (
+            "last_user_msg_ts" not in force
+            and _disk_lu > float(u.get("last_user_msg_ts", 0) or 0)
+        ):
             for f in ("last_user_msg_ts", "msg_count", "silent_until", "cues", "topics", "tier"):
                 if f in disk:
                     u[f] = disk[f]
@@ -389,23 +519,26 @@ def commit(u: Dict[str, Any]) -> None:
                 int(u.get("bot_msgs_since_user", 0) or 0),
                 int(disk.get("bot_msgs_since_user", 0) or 0),
             )
-        # pending 取并集（同一张条子只留一条），**完成态优先**
-        merged: Dict[Any, Dict[str, Any]] = {}
-        for p in list(u.get("pending", []) or []) + list(disk.get("pending", []) or []):
-            key = (p.get("kind"), str(p.get("text"))[:40], int(float(p.get("due_ts", 0) or 0)))
-            old = merged.get(key)
-            if old is None or p.get("done") or p.get("used"):
-                merged[key] = p
-        u["pending"] = list(merged.values())[-10:]
+        # pending 取并集（同一张条子只留一条），**完成态优先**；
+        # force 里点名了 pending 就以内存为准（reset 靠这个把条子真正清掉）
+        if "pending" not in force:
+            merged: Dict[Any, Dict[str, Any]] = {}
+            for p in list(u.get("pending", []) or []) + list(disk.get("pending", []) or []):
+                key = (p.get("kind"), str(p.get("text"))[:40], int(float(p.get("due_ts", 0) or 0)))
+                old = merged.get(key)
+                if old is None or p.get("done") or p.get("used"):
+                    merged[key] = p
+            u["pending"] = list(merged.values())[-10:]
 
         # 时间锚点按 due_ts 合并，已用过的优先保留
-        cu: Dict[Any, Dict[str, Any]] = {}
-        for c in list(u.get("cues", []) or []) + list(disk.get("cues", []) or []):
-            key = int(float(c.get("due_ts", 0) or 0))
-            oldc = cu.get(key)
-            if oldc is None or c.get("used"):
-                cu[key] = c
-        u["cues"] = list(cu.values())[-6:]
+        if "cues" not in force:
+            cu: Dict[Any, Dict[str, Any]] = {}
+            for c in list(u.get("cues", []) or []) + list(disk.get("cues", []) or []):
+                key = int(float(c.get("due_ts", 0) or 0))
+                oldc = cu.get(key)
+                if oldc is None or c.get("used"):
+                    cu[key] = c
+            u["cues"] = list(cu.values())[-6:]
 
     st.setdefault("users", {})[u["chat_key"]] = u
     st["last_chat_key"] = u["chat_key"]
@@ -446,6 +579,7 @@ def get_user(st: Dict[str, Any], chat_key: str) -> Dict[str, Any]:
             "memories": [],           # 带权重的记忆 [{text, weight, ts, kind}]
             "reflect_at": 0,          # 待反省的发送时间点
             "reflect_count": 0,       # 连续没人回的次数
+            "no_reply_count": 0,      # 连续没人回的次数（反省用，和 closer_count 分开）
             "last_reflect_ts": 0,
         }
         users[chat_key] = u
@@ -455,13 +589,25 @@ def get_user(st: Dict[str, Any], chat_key: str) -> Dict[str, Any]:
 # ======================================================================== 时间
 
 
+_HM_WARNED: set = set()
+
+
 def _parse_hm(s: str, default: str = "00:00") -> Tuple[int, int]:
-    try:
-        h, m = (s or default).split(":")
-        return int(h), int(m)
-    except Exception:
-        h, m = default.split(":")
-        return int(h), int(m)
+    """修复 C2：非法时间（25:00 / abc / 空串）回退默认值，并只告警一次，不让 tick 抛异常"""
+    raw = (s or "").strip()
+    if raw:
+        try:
+            h_s, m_s = raw.split(":")
+            h, m = int(h_s), int(m_s)
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return h, m
+        except Exception:
+            pass
+        if raw not in _HM_WARNED:
+            _HM_WARNED.add(raw)
+            core.logger.warning(f"[proactive3] 时间格式不对: {raw!r}，回退到 {default}")
+    h, m = default.split(":")
+    return int(h), int(m)
 
 
 def in_range(now: datetime, start_s: str, end_s: str) -> bool:
@@ -586,7 +732,33 @@ def _model_args() -> Dict[str, Any]:
     return {}
 
 
-async def llm_chat(prompt: str, max_tokens: int = 200, timeout: float = 25.0) -> str:
+_NO_MODEL_LOGGED = {"done": False}
+_GROUP_WARN_TS: Dict[str, float] = {}
+
+
+def _warn_group_once(chat_key: str) -> None:
+    """群闸门无答案的告警：同一群一小时内只写一次"""
+    now = _now()
+    last = float(_GROUP_WARN_TS.get(chat_key, 0) or 0)
+    if now - last >= 3600:
+        _GROUP_WARN_TS[chat_key] = now
+        core.logger.warning(f"[proactive3] 群聊闸门无有效回复，按否决 {chat_key}")
+
+
+def _log_no_model_once() -> None:
+    """没有可用模型时，只在启动后提示一次（避免每轮刷日志）"""
+    if not _NO_MODEL_LOGGED["done"]:
+        _NO_MODEL_LOGGED["done"] = True
+        core.logger.warning("[proactive3] 没有可用的对话模型，模型闸门按关闭处理（不会否决）")
+
+
+def _first_verdict(ans: str) -> Optional[str]:
+    """取回复里第一个 ALLOW / SKIP；找不到返回 None（= 无有效答案）"""
+    m = re.search(r"\b(ALLOW|SKIP)\b", (ans or "").upper())
+    return m.group(1) if m else None
+
+
+async def llm_chat(prompt: str, max_tokens: int = 200, timeout: float = 25.0, temperature: float = 0.8) -> str:
     """直接调模型（闸门/抽取用）。带硬超时：超时当作"无意见"，绝不卡住主线。"""
     if gen_openai_chat_response is None:
         return ""
@@ -600,7 +772,7 @@ async def llm_chat(prompt: str, max_tokens: int = 200, timeout: float = 25.0) ->
                 messages=[{"role": "user", "content": prompt}],
                 api_key=args.get("api_key") or None,
                 base_url=args.get("base_url") or None,
-                temperature=0.8,
+                temperature=temperature,
                 # 思考型模型（如 gemini-3.7-flash）会先花 token 思考，
                 # 给得太少会"正文为空"，所以下限抬到 200
                 max_tokens=max(200, max_tokens),
@@ -702,7 +874,9 @@ def affection_score(u: Dict[str, Any]) -> int:
         elif d <= 30:
             score += 2
 
-    rate = float(u.get("reply_rate", 0.7) or 0.7)
+    # 修复 B4：回复率真的是 0.0 时不能被 `or` 当成 0.7
+    _rr = u.get("reply_rate", None)
+    rate = 0.7 if _rr is None else float(_rr)
     score += (rate - 0.5) * 20
 
     return int(max(0, min(100, score)))
@@ -737,10 +911,21 @@ CARE_KEYWORDS = (
 def detect_care(text: str) -> Optional[str]:
     if not text or len(text) > 300:
         return None
+    # 修复 B1：命中否定词不算（"不头疼了""没发烧"）
     for k in CARE_KEYWORDS:
-        if k in text:
-            return k
+        start = 0
+        while True:
+            i = text.find(k, start)
+            if i < 0:
+                break
+            head = text[max(0, i - 4):i]
+            if not any(n in head for n in _NEGATIONS):
+                return k
+            start = i + len(k)
     return None
+
+
+_typing_tasks: set = set()
 
 
 async def _typing_once(chat_key: str) -> None:
@@ -766,7 +951,10 @@ async def show_typing(chat_key: str, seconds: float = 0.0) -> None:
     if "-private_" not in chat_key:
         return
     try:
-        asyncio.create_task(_typing_once(chat_key))
+        # 修复 C7：任务持引用，避免被 GC 提前回收
+        _task = asyncio.create_task(_typing_once(chat_key))
+        _typing_tasks.add(_task)
+        _task.add_done_callback(_typing_tasks.discard)
     except Exception:
         pass
 
@@ -823,15 +1011,14 @@ def group_allowed(chat_key: str) -> bool:
 # 什么算"重要的事"（权重高，记得久）
 _IMPORTANT_WORDS = (
     "面试", "考试", "答辩", "体检", "手术", "住院", "分手", "吵架", "辞职",
-    "入职", "搬家", "生日", "纪念日", "结婚", "毕业", "签证", "出差", "面试",
-    "生病", "发烧", "受伤", "去世", "难过", "崩溃", "哭", "焦虑", "失眠",
-    "喜欢", "讨厌", "害怕", "梦想", "决定", "后悔", "答应", "承诺",
+    "入职", "搬家", "生日", "纪念日", "结婚", "毕业", "签证", "出差",
+    "去世", "崩溃",
 )
 
 # 对方说这些 → 说明在忙/累（抑制"想你"类）
 _BUSY_WORDS = (
-    "累", "困", "加班", "忙", "开完会", "开会", "赶工", "deadline", "通宵",
-    "熬夜", "没睡", "好忙", "在忙", "忙死", "撑不住", "想睡",
+    "好累", "累死", "累坏", "加班", "在忙", "忙死", "好忙", "开会", "开完会",
+    "赶工", "deadline", "通宵", "熬夜", "没睡", "好困", "困死", "想睡", "撑不住",
 )
 
 # 敏感内容不进记忆（防污染）
@@ -853,8 +1040,28 @@ def memory_allowed(text: str) -> bool:
 # 对方说这些 → 说明状态不错（疲惫降、兴致升）
 _GOOD_WORDS = (
     "睡饱", "睡好", "精神", "开心", "舒服", "放松", "顺利", "搞定", "完成了",
-    "爽", "哈哈", "笑死", "好耶", "不错",
+    "笑死", "好耶",
 )
+
+
+# 修复 B1：命中关键词前 1~3 字内出现否定词就不算
+_NEGATIONS = ("不", "没", "别", "不太", "没那么", "一点也不", "从不")
+
+
+def hit_without_negation(s: str, words) -> bool:
+    """关键词命中且前面没有否定词"""
+    text = s or ""
+    for w in words:
+        start = 0
+        while True:
+            i = text.find(w, start)
+            if i < 0:
+                break
+            head = text[max(0, i - 4):i]
+            if not any(n in head for n in _NEGATIONS):
+                return True
+            start = i + len(w)
+    return False
 
 
 def memory_weight(text: str) -> float:
@@ -913,26 +1120,79 @@ def top_memories(u: Dict[str, Any], limit: int = 5) -> List[Dict[str, Any]]:
 
 
 def note_busy(u: Dict[str, Any], text: str) -> None:
-    """对方说忙/累 → 记一笔，一段时间内别推想你"""
+    """对方说忙/累 → 记一笔，一段时间内别推想你
+
+    修复 B1：关键词前有否定词不算（"今天不累""不忙"）。
+    修复 B7：好状态 30 分钟内只生效一次，避免连说几句"哈哈"把疲惫/兴致刷满。
+    """
     s = text or ""
     now = _now()
-    if any(w in s for w in _BUSY_WORDS):
+    if hit_without_negation(s, _BUSY_WORDS):
         u["user_busy_until"] = now + config.BUSY_QUIET_HOURS * 3600
         u["tired"] = min(100.0, float(u.get("tired", 20.0)) + 8.0)
         u["mood"] = max(0.0, float(u.get("mood", 60.0)) - 5.0)
-    if any(w in s for w in _GOOD_WORDS):
-        u["tired"] = max(0.0, float(u.get("tired", 20.0)) - 6.0)
-        u["mood"] = min(100.0, float(u.get("mood", 60.0)) + 8.0)
+    if hit_without_negation(s, _GOOD_WORDS):
+        last_good = float(u.get("good_state_ts", 0) or 0)
+        if now - last_good >= 30 * 60:
+            u["good_state_ts"] = now
+            u["tired"] = max(0.0, float(u.get("tired", 20.0)) - 6.0)
+            u["mood"] = min(100.0, float(u.get("mood", 60.0)) + 8.0)
+
+
+def urge_scale(u: Dict[str, Any], weekend: Optional[bool] = None) -> float:
+    """念头增速系数（修复 B4 + 可测试）"""
+    scale = max(0.0, config.ACTIVITY_LEVEL / 75.0)
+    is_weekend = datetime.now().weekday() >= 5 if weekend is None else weekend
+    if is_weekend:
+        scale *= 1.2
+    if config.ADAPTIVE_REPLY_RATE and int(u.get("pings", 0) or 0) >= 3:
+        _r = u.get("reply_rate", None)
+        _r = 1.0 if _r is None else max(0.0, min(1.0, float(_r)))
+        scale *= max(0.5, 0.5 + 0.5 * _r)
+    return scale
+
+
+def heartbeat_wait(now_dt: datetime, base_seconds: float) -> float:
+    """修复 B6：安静时段里若 QUIET_END 落在本次睡眠区间内，截短到 QUIET_END + 60 秒"""
+    try:
+        if not config.QUIET_END_WAKE or not in_quiet(now_dt):
+            return base_seconds
+        eh, em = _parse_hm(config.QUIET_END)
+        end = now_dt.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if end <= now_dt:
+            end = end + timedelta(days=1)
+        to_end = (end - now_dt).total_seconds() + 60
+        if 0 < to_end < base_seconds:
+            return max(60.0, to_end)
+    except Exception:
+        pass
+    return base_seconds
 
 
 def drift_mood(u: Dict[str, Any], minutes: float) -> None:
-    """疲惫/兴致随时间自然漂移"""
+    """疲惫/兴致随时间自然漂移
+
+    修复 A1：疲惫值原来只涨不落，第一晚之后轻由头几乎全被压住。
+    现在：
+      · 单次推进封顶 60 分钟，避免长时间停机后一次冲到 100
+      · 安静时段（in_quiet）当成她休息的时间，疲惫按固定速率恢复，而不是继续涨
+      · 其余时段保持原来的节奏
+    """
     h = datetime.now().hour
     tired = float(u.get("tired", 20.0))
     mood = float(u.get("mood", 60.0))
+    minutes = max(0.0, min(float(minutes), 60.0))
 
-    # 深夜越熬越累
-    if h >= 23 or h < 6:
+    quiet = False
+    try:
+        quiet = in_quiet()
+    except Exception:
+        quiet = False
+
+    if quiet:
+        # 安静时段 = 她在睡觉：疲劳按 0.05/分 恢复（最长的 7 小时约 -21）
+        tired -= 0.05 * minutes
+    elif h >= 23 or h < 6:
         tired += 0.15 * minutes
     elif 6 <= h < 10:
         tired -= 0.05 * minutes
@@ -1015,14 +1275,16 @@ def run_reflection(u: Dict[str, Any]) -> Optional[str]:
 
     if replied:
         u["reflect_count"] = 0
+        u["no_reply_count"] = 0
         u["mood"] = min(100.0, float(u.get("mood", 60.0)) + 6.0)
         u["tired"] = max(0.0, float(u.get("tired", 20.0)) - 4.0)
         return None
 
     u["reflect_count"] = int(u.get("reflect_count", 0) or 0) + 1
+    u["no_reply_count"] = int(u.get("no_reply_count", 0) or 0) + 1
     u["mood"] = max(0.0, float(u.get("mood", 60.0)) - 12.0)
-    u["closer_count"] = int(u.get("closer_count", 0) or 0) + 1
-    if int(u["reflect_count"]) >= 2:
+    # 修复 A3：反省不再动 closer_count（那个只表示"收场发了几次"）
+    if int(u["no_reply_count"]) >= 2:
         u["restraint_until"] = now + config.RESTRAINT_HOURS * 3600
         core.logger.info(
             f"[proactive3] 反省：连续 {u['reflect_count']} 次没人回，收敛 "
@@ -1044,36 +1306,31 @@ _PERFUNCTORY_WORDS = {
 
 
 # 填充词字符集：整句只由这些字组成时才算敷衍
-_FILLER_CHARS = set("嗯哦好行可以的在吗呀啊哈嘿嘻对是的没那这个了吧呢啦嘛嘞嘛~～.!！。…,，、 　1234567890")
+_FILLER_CHARS = set("嗯哦好行可以的在吗呀啊哈嘿嘻对是的没那这个了吧呢啦嘛嘞嘛~～.!！。…,，、 　")
 
 
 def is_perfunctory(text: str) -> bool:
-    """判断对方是不是敷衍了一句（只认纯应答，不误伤正常短句）"""
+    """判断对方是不是敷衍了一句（只认纯应答，不误伤正常短句）
+
+    修复 B2：
+      · 空文本（可能是纯图片/表情）不再算敷衍
+      · ≤2 字只在白名单里才算敷衍（"救命""别走""难受" 不算）
+      · 填充字符集去掉数字和标点（"123"、". . ." 不算纯填充，"…" 仍在白名单里）
+    """
     s = (text or "").strip()
     if not s:
-        return True
+        return False
     if s in _PERFUNCTORY_WORDS:
         return True
     if len(s) <= 2:
-        return True
-    # 短句且整句都是填充词字符 → 敷衍
+        return False
     if len(s) <= 8 and set(s) <= _FILLER_CHARS:
         return True
     return False
 
 
 # 时间锚点：对方说了"明天/今晚/周末"之类，到点可以问结果
-_CUE_PATTERNS = [
-    (r"明天(早上|上午|中午|下午|晚上)?", 1),
-    (r"后天(早上|上午|中午|下午|晚上)?", 2),
-    (r"今晚|今天晚上", 0),
-    (r"明天见|明天聊", 1),
-    (r"周末", None),
-    (r"下周([一二三四五六日天])?", 7),
-    (r"等会(儿)?|待会(儿)?|一会儿|稍后", 0),
-    (r"下班后|下班", 0),
-    (r"考试|面试|体检|复查|答辩", 1),
-]
+# （B3 之后具体正则写在 extract_cues 里，这里只留说明，不再有 _CUE_PATTERNS）
 
 _CN_WEEK = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
 
@@ -1093,40 +1350,63 @@ def extract_cues(text: str, now_ts: float) -> List[Dict[str, Any]]:
         d = (now + timedelta(days=days_ahead)).replace(hour=hour, minute=0, second=0, microsecond=0)
         return d.timestamp()
 
-    for pat, days in _CUE_PATTERNS:
-        m = re.search(pat, s)
-        if not m:
-            continue
+    # 修复 B3：一句话只记一个最具体的锚点；时段映射到小时；"等会儿"= +45 分钟
+    _HOUR_OF_DAY = {"早上": 8, "上午": 10, "中午": 12, "下午": 15, "晚上": 20}
+    _TOD = r"(早上|上午|中午|下午|晚上)"
 
-        due = None
-        if days is None:  # 周末
-            wd = now.weekday()  # 0=周一
-            ahead = (5 - wd) % 7
-            if ahead == 0 and now.hour >= 18:
-                ahead = 7
-            due = _at(ahead, 20)
-        elif days == 7:  # 下周X
-            ch = m.group(1) if m.groups() and m.group(1) else "一"
-            target_wd = _CN_WEEK.get(ch, 0)
-            ahead = (target_wd - now.weekday()) % 7 or 7
-            due = _at(ahead, 20)
-        elif days == 0:  # 今天/等会
-            due = _at(0, min(23, now.hour + 4))
-        else:
-            due = _at(int(days), 20)
+    def _hour_from(m) -> int:
+        if m and m.groups():
+            for g in m.groups():
+                if g and g in _HOUR_OF_DAY:
+                    return _HOUR_OF_DAY[g]
+        return 20
 
-        if due is None:
-            continue
-        if due <= now_ts:
-            continue
-        # 同一时间点只记一次（"明天面试" 会同时命中"明天"和"面试"）
-        if any(abs(c["due_ts"] - due) < 3600 for c in out):
-            continue
+    def _plus_minutes(minutes: int) -> float:
+        return (now + timedelta(minutes=minutes)).timestamp()
 
-        out.append({"text": s[:40], "due_ts": due, "used": False})
-        if len(out) >= 2:
-            break
+    cands = []   # (优先级, due_ts)  优先级越小越具体
+    # 1) 带具体日期的
+    m = re.search(r"明天" + _TOD + "?", s)
+    if m:
+        cands.append((1, _at(1, _hour_from(m))))
+    m = re.search(r"后天" + _TOD + "?", s)
+    if m:
+        cands.append((1, _at(2, _hour_from(m))))
+    m = re.search(r"今晚|今天晚上", s)
+    if m:
+        cands.append((1, _at(0, 20)))
+    m = re.search(r"(?<!下)下周([一二三四五六日天])?", s)
+    if m:
+        ch = m.group(1) if m.groups() and m.group(1) else "一"
+        target_wd = _CN_WEEK.get(ch, 0)
+        ahead = (target_wd - now.weekday()) % 7 or 7
+        cands.append((1, _at(ahead, 20)))
+    m = re.search(r"周末", s)
+    if m:
+        wd = now.weekday()
+        ahead = (5 - wd) % 7
+        if ahead == 0 and now.hour >= 18:
+            ahead = 7
+        cands.append((1, _at(ahead, 20)))
+    # 2) 事件类（没写具体哪天，默认明天对应时段）
+    m = re.search(r"考试|面试|体检|复查|答辩", s)
+    if m:
+        tm = re.search(_TOD, s[max(0, m.start() - 6): m.end() + 6])
+        cands.append((2, _at(1, _hour_from(tm) if tm else 20)))
+    # 3) 等会儿 / 待会儿 / 稍后 → +45 分钟
+    if re.search(r"等会(儿)?|待会(儿)?|一会儿|稍后", s):
+        cands.append((3, _plus_minutes(45)))
+    # 4) 下班后
+    if re.search(r"下班后|下班", s):
+        cands.append((4, _at(0, 18)))
 
+    if not cands:
+        return []
+    cands.sort(key=lambda x: x[0])
+    due = cands[0][1]
+    if due <= now_ts:
+        return []
+    out.append({"text": s[:40], "due_ts": due, "used": False})
     return out
 
 
@@ -1156,9 +1436,7 @@ def can_send(u: Dict[str, Any], special: bool) -> Tuple[bool, str]:
     if in_quiet() and not (special and config.SPECIAL_CARE_IGNORE_QUIET):
         return False, "安静时段"
 
-    if u.get("sent_date") != _today():
-        u["sent_date"] = _today()
-        u["sent_today"] = 0
+    ensure_today(u)
 
     if int(u.get("sent_today", 0)) >= config.MAX_SENDS_PER_DAY:
         return False, "达每日上限"
@@ -1187,23 +1465,86 @@ def due_pending(u: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-async def derive_reason(u: Dict[str, Any], msgs: List[Dict[str, Any]]) -> Optional[Tuple[str, str, Any]]:
-    """找一个由头 → (描述, 类型)"""
+# 修复 A8：同一 kind 未完成的只留一条；取用时按重要性挑，并丢弃过期的
+_PENDING_PRIORITY = {"care": 0, "probe": 1, "followup": 2, "continue": 3}
+_PENDING_MAX_AGE = {"care": 12 * 3600.0}
+
+
+def queue_pending(u: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
+    """入队：同 kind 且未完成的只保留一条，新的刷新文本和到期时间"""
+    kind = item.get("kind")
+    items = u.setdefault("pending", [])
+    for p in items:
+        if (not p.get("done")) and p.get("kind") == kind:
+            p["text"] = item.get("text", p.get("text"))
+            p["due_ts"] = item.get("due_ts", p.get("due_ts"))
+            p["refreshed_ts"] = _now()
+            return p
+    items.append(item)
+    return item
+
+
+def pending_max_age(kind: str) -> float:
+    return float(_PENDING_MAX_AGE.get(kind, config.FOLLOWUP_MAX_MINUTES * 60 * 2))
+
+
+def sweep_expired(u: Dict[str, Any]) -> int:
+    """把过期的待办标掉（不管本轮能不能派上由头）。
+    返回被标掉的条数；调用方有变化时才写盘。"""
+    n = 0
+    now_ts = _now()
+    for p in u.get("pending", []) or []:
+        if p.get("done"):
+            continue
+        kind_p = str(p.get("kind", "followup"))
+        if now_ts - float(p.get("due_ts", 0) or 0) > pending_max_age(kind_p):
+            p["done"] = True
+            p["expired"] = True
+            n += 1
+    if n and config.DEBUG:
+        core.logger.info(f"[proactive3] 过期清理 {n} 条待办")
+    return n
+
+
+async def derive_reason(
+    u: Dict[str, Any],
+    msgs: List[Dict[str, Any]],
+    dry: bool = False,
+) -> Optional[Tuple[str, str, Any]]:
+    """找一个由头 → (描述, 类型, 附带引用)
+
+    dry=True 时只预览：不写任何状态（不推进回访冷却、不记问候）。
+    """
+
 
     # 1) 到期未完话题（追问/接话/回访）
     # 注意：这里不标记 done —— 万一被闸门否决，条子要留着下次再用
     pend = due_pending(u)
     if pend:
-        p = pend[0]
-        kind_p = str(p.get("kind", "followup"))
-        # 跨段护栏：两次接话/追问之间至少隔 FOLLOWUP_COOLDOWN_MINUTES
-        _cool = kind_p in ("probe", "followup", "continue") and (
-            minutes_since(u.get("last_followup_ts", 0)) < config.FOLLOWUP_COOLDOWN_MINUTES
-        )
-        if _cool:
-            if config.DEBUG:
-                core.logger.info("[proactive3] 接话冷却中，先找别的由头")
-        else:
+        # 修复 A8：先把过期的全部标掉（不管排不排得上），再按重要性挑
+        _now_ts = _now()
+        alive = []
+        for p in pend:
+            kind_p = str(p.get("kind", "followup"))
+            _age = _now_ts - float(p.get("due_ts", 0) or 0)
+            if _age > pending_max_age(kind_p):
+                if not dry:
+                    p["done"] = True
+                    p["expired"] = True
+                continue
+            alive.append(p)
+
+        pend = sorted(alive, key=lambda p: _PENDING_PRIORITY.get(str(p.get("kind")), 9))
+        for p in pend:
+            kind_p = str(p.get("kind", "followup"))
+            # 跨段护栏：两次接话/追问之间至少隔 FOLLOWUP_COOLDOWN_MINUTES
+            _cool = kind_p in ("probe", "followup", "continue") and (
+                minutes_since(u.get("last_followup_ts", 0)) < config.FOLLOWUP_COOLDOWN_MINUTES
+            )
+            if _cool:
+                if config.DEBUG:
+                    core.logger.info("[proactive3] 接话冷却中，先找别的由头")
+                continue
             return str(p["text"]), kind_p, p
 
     # 2) 时间锚点（同样：发送成功后才标记 used）
@@ -1222,7 +1563,8 @@ async def derive_reason(u: Dict[str, Any], msgs: List[Dict[str, Any]]) -> Option
         and now >= float(u.get("last_loop_check_ts", 0)) + loop_cd
         and minutes_since(u.get("last_proactive_ts", 0)) > config.LOOP_MIN_HOURS * 60
     ):
-        u["last_loop_check_ts"] = now
+        if not dry:
+            u["last_loop_check_ts"] = now
         topic = await extract_unresolved(msgs, top_memories(u, 5))
         if topic:
             return topic, "loop", None
@@ -1233,9 +1575,9 @@ async def derive_reason(u: Dict[str, Any], msgs: List[Dict[str, Any]]) -> Option
         win = greeting_window(datetime.now())
         greeted = u.setdefault("greeted", {})
         if win and greeted.get(win) != _today():
-            greeted[win] = _today()
             label = {"morning": "早安", "midday": "午间", "night": "晚安"}.get(win, "问候")
-            return f"{label}问候（对方挺久没说话了，主动打个招呼）", "greeting", None
+            # 修复 A2：这里只给由头，不写 greeted；发送成功后由 tick 记账
+            return f"{label}问候（对方挺久没说话了，主动打个招呼）", "greeting", {"win": win}
 
     # 5) 想念通道（关系够近才允许说想你了）
     if (
@@ -1281,7 +1623,7 @@ async def extract_unresolved(msgs: List[Dict[str, Any]], memories: Optional[List
     if convo:
         prompt += f"【最近对话】\n{convo}\n"
 
-    ans = (await llm_chat(prompt, max_tokens=60, timeout=25.0)).strip().replace("\n", " ")[:60]
+    ans = (await llm_chat(prompt, max_tokens=60, timeout=25.0, temperature=0.3)).strip().replace("\n", " ")[:60]
     if not ans or "NONE" in ans.upper():
         return None
     return f"想起对方之前提过「{ans}」，不知道后来怎么样了，问问"
@@ -1308,8 +1650,21 @@ async def gate(u: Dict[str, Any], reason: str, msgs: List[Dict[str, Any]]) -> bo
         "标准：由头自然、现在说合适 → ALLOW；显得多余/打扰/没必要 → SKIP\n"
         "只回一个词：ALLOW 或 SKIP"
     )
-    ans = (await llm_chat(prompt, max_tokens=200, timeout=20.0)).upper()
-    if "SKIP" in ans:
+    # 修复 A9：三态闸门
+    #   没有可用模型 → 视为关闭（放行），只在启动时提示一次
+    #   有模型但本次没答案（超时/异常/空）→ 否决 + 冷却
+    #   有答案 → 取第一个 ALLOW|SKIP 判定
+    if not _model_args():
+        _log_no_model_once()
+        return True
+
+    ans = (await llm_chat(prompt, max_tokens=200, timeout=20.0, temperature=0.3)).upper()
+    verdict = _first_verdict(ans)
+    if verdict is None:
+        u["gate_skip_until"] = now + config.SKIP_COOLDOWN_MINUTES * 60
+        core.logger.warning(f"[proactive3] 闸门无有效回复，按否决处理: {reason[:40]}")
+        return False
+    if verdict == "SKIP":
         u["gate_skip_until"] = now + config.SKIP_COOLDOWN_MINUTES * 60
         core.logger.info(f"[proactive3] 闸门否决: {reason[:40]}")
         return False
@@ -1361,14 +1716,9 @@ async def send_with_reason(u: Dict[str, Any], reason: str, kind: str) -> bool:
     u["reply_credit_ts"] = u.get("reply_credit_ts", 0)
     u["reflect_at"] = now          # v4：一小时后回看有没有人接
     u["tired"] = min(100.0, float(u.get("tired", 20.0)) + 3.0)  # 主动说话也费神
-    if u.get("sent_date") != _today():
-        u["sent_date"] = _today()
-        u["sent_today"] = 0
+    ensure_today(u)
     u["sent_today"] = int(u.get("sent_today", 0)) + 1
     if kind == "miss":
-        if u.get("miss_date") != _today():
-            u["miss_date"] = _today()
-            u["miss_today"] = 0
         u["miss_today"] = int(u.get("miss_today", 0)) + 1
 
     log = u.setdefault("log", [])
@@ -1402,8 +1752,17 @@ async def group_gate(chat_key: str, g: Dict[str, Any], msgs: List[Dict[str, Any]
         "接得上、自然、不抢话 → ALLOW；没必要或会突兀 → SKIP\n"
         "只回一个词：ALLOW 或 SKIP"
     )
-    ans = (await llm_chat(prompt, max_tokens=200, timeout=20.0)).upper()
-    if "SKIP" in ans:
+    if not _model_args():
+        _log_no_model_once()
+        return True
+
+    ans = (await llm_chat(prompt, max_tokens=200, timeout=20.0, temperature=0.3)).upper()
+    verdict = _first_verdict(ans)
+    if verdict is None:
+        # 修复 R22：不依赖 DEBUG；同一群 1 小时内只写一次
+        _warn_group_once(chat_key)
+        return False
+    if verdict == "SKIP":
         if config.DEBUG:
             core.logger.info(f"[proactive3] 群聊闸门否决({intent}) {chat_key}")
         return False
@@ -1530,12 +1889,15 @@ async def group_flow_tick(st: Dict[str, Any]) -> bool:
 def cleanup_users(st: Dict[str, Any]) -> int:
     if config.USER_RETENTION_DAYS <= 0:
         return 0
-    keep_key = (config.CHAT_KEY or "").strip()
+    # 修复 C3：目标私聊用归一化后的 key；从没说过话的用户（播种进来的）不清
+    keep_key = normalize_chat_key((config.CHAT_KEY or "").strip())
     removed = 0
     for k in list((st.get("users") or {}).keys()):
         if k == keep_key:
             continue
         u = st["users"][k]
+        if float(u.get("last_user_msg_ts", 0) or 0) <= 0:
+            continue
         if days_since(u.get("last_user_msg_ts", 0)) > config.USER_RETENTION_DAYS:
             st["users"].pop(k, None)
             removed += 1
@@ -1578,7 +1940,12 @@ async def scheduler_loop() -> None:
 
         lo = max(1, int(config.HEARTBEAT_MIN_MINUTES))
         hi = max(lo, int(config.HEARTBEAT_MAX_MINUTES))
-        await asyncio.sleep(random.randint(lo, hi) * 60)
+        _base_gap = float(random.randint(lo, hi) * 60)
+        # 修复 B6：统一走 heartbeat_wait（安静时段截短到 QUIET_END + 60 秒）
+        _wait = heartbeat_wait(datetime.now(), _base_gap)
+        if _wait < _base_gap:
+            core.logger.info(f"[proactive3] 安静时段，心跳截短到 {_wait / 60:.0f} 分钟")
+        await asyncio.sleep(_wait)
 
 
 async def tick() -> None:
@@ -1587,12 +1954,14 @@ async def tick() -> None:
 
     core.logger.info("[proactive3] tick 开始")
 
+    # 修复 R21-3：tick 起点必须在任何 await / load_state 之前
+    _tick_start = _now()
     st = load_state()
 
     # 群聊心流（独立于私聊念头）
     try:
         if await group_flow_tick(st):
-            save_state(st)
+            flush_groups(st)
     except Exception as e:
         core.logger.warning(f"[proactive3] 群心流异常: {e}")
 
@@ -1614,14 +1983,34 @@ async def tick() -> None:
     uid = chat_key.split("_")[-1]
     special = is_special_care(u)
 
+    # 修复 R21-4：固定扫过期待办（这里没有 await；早退路径在上面已经返回，扫不到也没关系）
+    try:
+        sweep_expired(u)
+    except Exception as e:
+        core.logger.warning(f"[proactive3] 过期清理异常: {e}")
+
+    # 修复 A4：记下疲惫/兴致的基准值，方便按增量合并
+    _base = {"tired": float(u.get("tired", 20.0)), "mood": float(u.get("mood", 60.0))}
+
+    def _commit_tick() -> None:
+        commit(
+            u,
+            deltas={
+                "tired": float(u.get("tired", 20.0)) - _base["tired"],
+                "mood": float(u.get("mood", 60.0)) - _base["mood"],
+            },
+            tick_start_ts=_tick_start,
+        )
+        # 修复 R21-2：提交后重置基准，避免同一 tick 多次 commit 重复计增量
+        _base["tired"] = float(u.get("tired", 20.0))
+        _base["mood"] = float(u.get("mood", 60.0))
+
     # ---- 念头累积 ----
     now = _now()
     last_tick = float(u.get("last_tick_ts", 0)) or now
     u["last_tick_ts"] = now
     minutes = max(1.0, (now - last_tick) / 60.0)
-    scale = max(0.0, config.ACTIVITY_LEVEL / 75.0)
-    if datetime.now().weekday() >= 5:
-        scale *= 1.2
+    scale = urge_scale(u)
     gain = (minutes / max(1.0, config.URGE_REFILL_HOURS * 60.0)) * 100.0 * scale
     u["urge"] = min(100.0, float(u.get("urge", 0.0)) + gain)
 
@@ -1651,7 +2040,7 @@ async def tick() -> None:
         config.CLOSER_ENABLED
         and int(u.get("bot_msgs_since_user", 0)) >= 1
         and hours_since(u.get("last_bot_msg_ts", 0)) >= config.CLOSER_AFTER_HOURS
-        and int(u.get("closer_count", 0)) < 3
+        and int(u.get("closer_count", 0)) < int(getattr(config, "CLOSER_MAX_COUNT", 3))
         and hours_since(u.get("closer_try_ts", 0)) >= 6.0
     ):
         u["closer_try_ts"] = now
@@ -1659,50 +2048,58 @@ async def tick() -> None:
         if ok and await gate(u, "自己上一条没人接，想自言自语收个尾", []):
             if await send_with_reason(u, "自己上一条没人接，想自言自语收个尾（别追问、别提没人回）", "closer"):
                 u["closer_count"] = int(u.get("closer_count", 0)) + 1
-                commit(u)
+                _commit_tick()
                 return
 
     # ---- 念头未满 ----
     if float(u.get("urge", 0)) < 100.0:
         if config.DEBUG:
             core.logger.info(f"[proactive3] 念头 {float(u.get('urge', 0)):.0f}/100")
-        commit(u)
+        _commit_tick()
         return
 
     # ---- 硬闸 ----
     ok, why = can_send(u, special)
-    core.logger.info(f"[proactive3] 诊断·硬闸 ok={ok} why={why or '-'} urge={float(u.get('urge', 0)):.0f}")
+    if config.DEBUG:
+        core.logger.info(f"[proactive3] 诊断·硬闸 ok={ok} why={why or '-'} urge={float(u.get('urge', 0)):.0f}")
     if not ok:
         if config.DEBUG:
             core.logger.info(f"[proactive3] 攒满但被拦: {why}")
-        commit(u)
+        _commit_tick()
         return
 
     # ---- 由头 ----
     msgs = await fetch_recent(chat_key, 16)
-    core.logger.info(f"[proactive3] 诊断·历史 {len(msgs)} 条")
+    if config.DEBUG:
+        core.logger.info(f"[proactive3] 诊断·历史 {len(msgs)} 条")
     got = await derive_reason(u, msgs)
-    core.logger.info(f"[proactive3] 诊断·由头 {got[1] if got else 'None'}")
+
+    if config.DEBUG:
+        core.logger.info(f"[proactive3] 诊断·由头 {got[1] if got else 'None'}")
     if not got:
         if config.DEBUG:
             core.logger.info("[proactive3] 派不出由头，念头留着")
-        commit(u)
+        _commit_tick()
         return
     reason, kind, pending_ref = got
 
     # ---- v4：抑制层（累了 / 对方在忙 / 刚反省过 → 忍住，不问模型）----
     sup = check_suppression(u, kind)
     if sup:
-        commit(u)
+        _commit_tick()
         return
 
     # ---- 闸门 ----
     if not await gate(u, reason, msgs):
-        commit(u)
+        _commit_tick()
         return
 
     # ---- 开口（成功后才消耗这条由头）----
     if await send_with_reason(u, reason, kind):
+        if kind == "greeting" and isinstance(pending_ref, dict) and pending_ref.get("win"):
+            # 修复 A2：问候发送成功后才记"今天这个窗口已经问候过"
+            u.setdefault("greeted", {})[str(pending_ref["win"])] = _today()
+            pending_ref = None
         if pending_ref is not None:
             if kind == "cue":
                 pending_ref["used"] = True
@@ -1723,7 +2120,7 @@ async def tick() -> None:
                     "kind": "continue",
                     "done": False,
                 })
-    commit(u)
+    _commit_tick()
 
 
 # ======================================================================== 生命周期
@@ -1836,7 +2233,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage):
                         samples.append(txt[:100])
                         keep = max(0, int(config.GROUP_REF_SAMPLE_SIZE))
                         g["samples"] = samples[-keep:] if keep else []
-                save_state(_st)
+                flush_groups(_st)
             except Exception as e:
                 core.logger.warning(f"[proactive3] 群状态更新失败: {e}")
         return None
@@ -1854,14 +2251,32 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage):
     except Exception:
         text = ""
 
+    # 修复 B8：命令消息不算"对方说话"，不做任何状态更新
+    if text.startswith("/"):
+        return None
+
     now = _now()
-    prev_bot = float(u.get("last_bot_msg_ts", 0))
+
+    # 修复 A7：prev_bot 用"本条之前她最近一条发言"，
+    # 而不是 last_bot_msg_ts（那个只记录主动消息的时间）。
+    prev_bot = 0.0
+    try:
+        _recent = await fetch_recent(chat_key, 8)
+        for _m in reversed(_recent):
+            if _m.get("is_bot") and float(_m.get("ts", 0) or 0) < now - 1:
+                prev_bot = float(_m["ts"])
+                break
+    except Exception as e:
+        core.logger.warning(f"[proactive3] 取她最近发言失败（按无处理）: {e}")
+        prev_bot = 0.0
+
     silence_min = (now - prev_bot) / 60.0 if prev_bot else 0.0
 
     u["last_user_msg_ts"] = now
     u["bot_msgs_since_user"] = 0
     u["silent_until"] = 0
     u["closer_count"] = 0
+    u["no_reply_count"] = 0
     u["msg_count"] = int(u.get("msg_count", 0)) + 1
     st["last_chat_key"] = chat_key
 
@@ -1869,7 +2284,9 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage):
     u["tier"] = update_tier(u)
 
     # 话题记忆（v4：带权重）
-    if text and len(text) > 2:
+    # 修复 C6：topics 是死数据（没有任何地方读它），但会明文存原文，
+    # 所以写入前先过一遍敏感词过滤，和记忆走同一套规则。
+    if text and len(text) > 2 and memory_allowed(text):
         topics = u.setdefault("topics", [])
         topics.append({"text": text[:80], "ts": now})
         u["topics"] = topics[-30:]
@@ -1904,7 +2321,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage):
     if config.CARE_ENABLED and text:
         sym = detect_care(text)
         if sym:
-            u.setdefault("pending", []).append({
+            queue_pending(u, {
                 "text": f"对方刚才说「{sym}」不舒服，过一阵问问好点没、有没有吃药",
                 "due_ts": now + config.CARE_AFTER_MINUTES * 60,
                 "kind": "care",
@@ -1912,9 +2329,14 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage):
             })
             core.logger.info(f"[proactive3] 记下生病关怀（{sym}）")
 
-    # ---- 敷衍 → 过一会儿追问那件事 ----
-    if config.FOLLOWUP_ENABLED and prev_bot and is_perfunctory(text):
-        u.setdefault("pending", []).append({
+    # ---- 敷衍 → 过一会儿追问那件事（A7：要求她最近一条发言在 120 分钟内）----
+    if (
+        config.FOLLOWUP_ENABLED
+        and prev_bot
+        and (now - prev_bot) <= 120 * 60
+        and is_perfunctory(text)
+    ):
+        queue_pending(u, {
             "text": "对方刚才回得很敷衍，过一会儿把那件事再问一句",
             "due_ts": now + config.PROBE_AFTER_MINUTES * 60,
             "kind": "probe",
@@ -1925,10 +2347,10 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage):
     if (
         config.FOLLOWUP_ENABLED
         and prev_bot
-        and silence_min > config.FOLLOWUP_AFTER_MINUTES
+        and config.FOLLOWUP_AFTER_MINUTES < silence_min <= config.FOLLOWUP_MAX_MINUTES
         and not is_perfunctory(text)
     ):
-        u.setdefault("pending", []).append({
+        queue_pending(u, {
             "text": "对方隔了很久才回来，接着刚才的话头问一句",
             "due_ts": now + config.PROBE_AFTER_MINUTES * 60,
             "kind": "followup",
@@ -1970,23 +2392,42 @@ async def proactive_cmd(
     st = load_state()
     chat_key = (config.CHAT_KEY or "").strip() or st.get("last_chat_key", "")
     u = get_user(st, chat_key) if chat_key else None
+    # 修复 R24-2：status 也要先跨天清零，否则会显示昨天的"今日已发"
+    if u:
+        ensure_today(u)
 
     if sub in ("on", "off"):
         config.ENABLE = (sub == "on")
-        return CmdCtl.success(f"已{'开启' if sub == 'on' else '关闭'}主动消息（重启后生效）")
+        # 修复 C4：on 时如果调度器没在跑就拉起来；off 等下一轮自然停
+        if sub == "on":
+            global _scheduler_task
+            if _scheduler_task is None or _scheduler_task.done():
+                _scheduler_task = asyncio.create_task(scheduler_loop())
+                return CmdCtl.success("已开启主动消息，调度器已启动")
+            return CmdCtl.success("已开启主动消息（调度器本来就在跑）")
+        return CmdCtl.success("已关闭主动消息（当前这轮结束后不再发，重启后也不会启动）")
 
     if sub == "reset":
-        if u:
-            u.update({
-                "urge": 0.0,
-                "sent_today": 0,
-                "sent_date": _today(),
-                "pending": [],
-                "silent_until": 0,
-                "gate_skip_until": 0,
-                "closer_count": 0,
-            })
-        commit(u)
+        if not u:
+            return CmdCtl.failed("没有目标私聊（请先配置 CHAT_KEY 或先私聊一次）")
+        u.update({
+            "urge": 0.0,
+            "sent_today": 0,
+            "sent_date": _today(),
+            "pending": [],
+            "silent_until": 0,
+            "gate_skip_until": 0,
+            "closer_count": 0,
+            "no_reply_count": 0,
+            "miss_today": 0,
+            "reflect_count": 0,
+            "suppress_count": {},
+            "restraint_until": 0,
+        })
+        # A4：reset 要能真正清掉，不能被磁盘上的旧值合并顶回来
+        commit(u, force={"pending", "cues", "sent_today", "sent_date", "closer_count",
+                         "no_reply_count", "urge", "silent_until", "gate_skip_until",
+                         "miss_today", "reflect_count", "suppress_count", "restraint_until"})
         return CmdCtl.success("已重置念头、冷却与停发状态")
 
     if sub == "log":
@@ -2003,7 +2444,7 @@ async def proactive_cmd(
         if not u:
             return CmdCtl.failed("没有目标私聊（请先配置 CHAT_KEY）")
         msgs = await fetch_recent(chat_key, 16)
-        got = await derive_reason(u, msgs)
+        got = await derive_reason(u, msgs, dry=True)
         if not got:
             return CmdCtl.success("此刻派不出由头（这轮不会说话）")
         reason, kind, _ref = got
@@ -2011,7 +2452,7 @@ async def proactive_cmd(
         _saved_skip = float(u.get("gate_skip_until", 0) or 0)
         g = await gate(u, reason, msgs)
         u["gate_skip_until"] = _saved_skip
-        save_state(st)
+        commit(u)
         verdict = "模型会放行" if g else "模型会否决"
         return CmdCtl.success(
             f"【预览·不发送】\n"
@@ -2040,11 +2481,19 @@ async def proactive_cmd(
     now = _now()
     pending_n = len([p for p in u.get("pending", []) if not p.get("done")])
     restraint = now < float(u.get("restraint_until", 0) or 0)
+    # 修复 R22：闸门有三种态 —— 关 / 开+有模型 / 开但无可用模型
+    if not config.LLM_GATE:
+        gate_line = "关"
+    elif not _model_args():
+        gate_line = "开·无可用模型（按关闭处理）"
+    else:
+        gate_line = "开"
     lines = [
         "主动消息 v4（念头驱动 · 抑制 · 记忆 · 反省）",
         f"开关：{'开' if config.ENABLE else '关'}   "
-        f"闸门：{'开' if config.LLM_GATE else '关'}   "
+        f"闸门：{gate_line}   "
         f"抑制：{'开' if config.SUPPRESS_ENABLED else '关'}",
+        f"当前时间：{datetime.now().strftime('%H:%M')}（服务器本地）",
         f"目标：{chat_key}",
         f"念头：{float(u.get('urge', 0)):.0f}/100（攒满约 {config.URGE_REFILL_HOURS}h）",
         f"今日已发：{u.get('sent_today', 0)}/{config.MAX_SENDS_PER_DAY}",

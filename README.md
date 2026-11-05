@@ -149,6 +149,10 @@
 | `USER_COOLDOWN_MINUTES` | 30 | 两次之间最短间隔 |
 | `RECENT_TALK_MINUTES` | 18 | 刚聊完多久内不另起话题 |
 | `HEARTBEAT_MIN_MINUTES` / `..._MAX_...` | 8 / 30 | 心跳间隔（决定各项分钟级配置的精度） |
+| `QUIET_END_WAKE` | `true` | 安静时段结束时补一次评估；心跳会截短到安静结束 |
+| `CLOSER_ENABLED` / `CLOSER_AFTER_HOURS` | `true` / 8 | 她说完没人接，多久后自己收个尾 |
+| `CLOSER_MAX_COUNT` | 3 | 最多收场几次 |
+| `ADAPTIVE_REPLY_RATE` | `true` | 按回复率调整念头增速（回得少就说得少） |
 
 ### v4 拟真
 
